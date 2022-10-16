@@ -1,17 +1,9 @@
 /*
 ---------------------------------------------
 Author: Adilson Luiz
-Data de Criação: 28/09/21
-Data de modificação: 29/09/21
 Função: Clona grupos de um usuário para o outro.
-Teste em PDI: 28/09/21
-Teste em DEV: 29/09/21
-Teste em QA:
-Executado em PRD:
 ---------------------------------------------
 
-Cuidados ao utilizar.
-Atentar-se ao sys_id de usuário clone e novo usuário.
 
 ---------------------------------------------
 Tabelas utilizadas para operação
@@ -19,101 +11,141 @@ sys_user
 sys_user_grmember
 */
 
-// Control variables
-var groupsNotAvaliabe = []; // Grupos que não vão ser clonados.
-var cloneUserSys_id = ''; // Usuário que servirá como base de clone
-var newUserSys_id = ''; // Usuário que receberá os grupos do usuário clone.
-var defaultPassword = '';
+var CloneUserGroups = Class.create();
+CloneUserGroups.prototype = Object.extendsObject(AbstractAjaxProcessor, {
 
-cloneUserNotSSO()
+    initialize: function (baseUserID) {
+        this.debug = false;
+        this._grBaseUser = new GlideRecord('sys_user');
+        this._grBaseUser.get(baseUserID);
+        this._printDebug('Sys_id User in the constructor: ' + this._grBaseUser.sys_id);
+        this._groupsForbiddenNames = []; // Add here prohibited groups names
+        this._mirroUserID = null;
+        this.totalGroupsToClone = this.getTotalGroupsToClone()
+    },
 
-function cloneUserNotSSO() {
-    // Clone all groups user.
 
-    var grUser = new GlideRecord('sys_user');
-    runQuery(grUser, 'sys_id=' + cloneUserSys_id);
+    _getBaseUserGroups: function () {
+        /*
+            Get all groups of the state user and build an object with this information
+        
+        */
+        var AllGroups = {};
+        var grGroups = GlideRecord('sys_user_grmember');
+        grGroups.addEncodedQuery('user.sys_id=' + this._grBaseUser.getUniqueValue());
+        grGroups.query();
+        this._printDebug('Total group of user: ' + grGroups.getRowCount());
 
+        while (grGroups.next()) {
+            var groupName = grGroups.getDisplayValue('group').toLowerCase();
+            var groupRelationshipID = grGroups.getValue('group'); // Get Sys_id of reference field group.
 
-    var groupsToClone = getGroups(grUser.user_name);
-    for(var group in groupsToClone) {
-        insertGroups(newUserSys_id, groupsToClone[group]);
-    }
+            // If group exist inside the prohibite groups list.
+            if (this._groupsForbiddenNames.indexOf(groupName) == -1) {
+                AllGroups[groupName] = groupRelationshipID; // Constructing dinamic object with group name and sys_id
+            }
+        }
+        this._printDebug('INFO: Groups Object: ' + JSON.stringify(AllGroups))
+        return AllGroups;
+    },
 
-    setNewPassword(newUserSys_id);
-}
+    setMirroUserID: function (userID) {
+        var grMirrorUser = new GlideRecord('sys_user');
+        grMirrorUser.get(userID);
+        this._printDebug('MirrorUser Query: ' + grMirrorUser.isValidRecord());
 
-// Run query in grObject
-function runQuery(grObject, query) {
-    grObject.addEncodedQuery(query);
-    grObject.query();
-    grObject.next();
-}
-
-function getGroups(userID) {
-    var grGroups = GlideRecord('sys_user_grmember');
-    var AllGroupsName = [];
-    var AllGroups = {};
-
-    grGroups.addEncodedQuery('user.user_name=' + userID);
-    grGroups.query();
-
-    while(grGroups.next()) {
-        var group = grGroups.getDisplayValue('group');
-        /* Se grupo atual estiver dentro da lista de grupos proibidos,
-        Grupo não será adicionado.
-        */ 
-        if(groupsNotAvaliabe.indexOf(group) == -1) {
-            AllGroupsName.push(group);
+        if (!grMirrorUser.isValidRecord()) {
+            return this._printDebug('FATAL ERROR: The MirrorUserID "' + userID + '" dont exist in your instance!');
         }
 
-    }
-    var grGroup = new GlideRecord('sys_user_group');
-    var queryName = 'nameIN';
-    for (var g in AllGroupsName) {
-        queryName += AllGroupsName[g] + ',';
-    }
-    grGroup.addEncodedQuery(queryName);
-    grGroup.query()
-    while(grGroup.next()) {
-        AllGroups[grGroup.name] = grGroup.getUniqueValue('name');
-    }
+        this._mirroUserID = userID;
+    },
 
-    return AllGroups;
-}
+    addProhibitedGroup: function (groupName) {
+        /*
+            Add groups to not clone
+        */
+        var grGroup = new GlideRecord('sys_user_group');
+        grGroup.addQuery('name', '=', groupName);
+        grGroup.query();
 
-function setNewPassword(userSys_id) {
-    // Ainda em implementação
-    var grUser = new GlideRecord('sys_user');
-    grUser.addEncodedQuery('sys_id=' + userSys_id);
-    grUser.query();
-    grUser.next();
-    grUser.setValue('password_needs_reset', true);
-    grUser.setValue('user_password', defaultPassword);
-    grUser.save();
-}
-// Insere os grupos que são enviados via Sys_ID
-function insertGroups(sys_IDNewUser, sys_idGroup) {
+        if (grGroup.hasNext()) {
+            this._groupsForbiddenNames.push(grGroup.toLowerCase());
+        }
+        else {
+            this._printDebug('WARNING: Group "' + groupName + '" not exist in your instance!');
+        }
+    },
 
-    var grUser = new GlideRecord('sys_user');
-    grUser.addQuery('sys_id', '=', sys_IDNewUser);
-    //grUser.addActiveQuery();
-    grUser.query();
-    gs.log('Usuário: ' + sys_IDNewUser);
-    gs.log('Grupo: ' + sys_idGroup);
-    while (grUser.next()) {
+
+    _insertGroups: function (groupID, mirroUserID) {
+
+        this._printDebug('INFO: Sys_id group to inserted: ' + groupID);
 
         var grGroups = new GlideRecord('sys_user_grmember');
-        grGroups.addQuery('user' , grUser.sys_id);
-        grGroups.addQuery('group' , sys_idGroup);   // sys_id group
+        // Execute query frist, to check if group record dont exist in the grmember table.
+        grGroups.addQuery('user', mirroUserID);
+        grGroups.addQuery('group', groupID);
         grGroups.query();
-        if(!grGroups.next()) {
-            grGroups.initialize();
-            grGroups.user = grUser.sys_id;
-            grGroups.group = sys_idGroup; // sys_id group
-            grGroups.insert();
-            gs.log('Group: ' + sys_idGroup + ' record inserted');
+
+        if (!grGroups.hasNext()) { // If not existe the record, proced to insert Group
+            var recordInit = new GlideRecord('sys_user_grmember');
+            recordInit.initialize();
+            recordInit.user = mirroUserID;
+            recordInit.group = groupID; // sys_id group
+            this._printDebug('INFO: new record user valuer: ' + recordInit.user);
+            this._printDebug('INFO: new record group valuer: ' + recordInit.group);
+            this._printDebug('WARNING: Group Inserted: ' + groupID.toUpperCase());
+            recordInit.insert();
 
 
         }
-    }
-}
+        else {
+            this._printDebug('INFO: The Group "' + groupID + ' always exist in user "' + mirroUserID + '" and is not inseted!');
+        }
+
+    },
+
+
+    getTotalGroupsToClone: function () {
+
+        var grGroups = GlideRecord('sys_user_grmember');
+        grGroups.addEncodedQuery('user.sys_id=' + this._grBaseUser.getUniqueValue());
+        grGroups.query();
+        this._printDebug('Total group of user: ' + grGroups.getRowCount());
+
+        return grGroups.getRowCount();
+    },
+
+
+    executeCloneGroups: function () {
+        // Execute the clone user
+
+        // Get groups to clone 
+        var groupsToClone = this._getBaseUserGroups();
+
+
+        if (this._mirroUserID == null || this.totalGroupsToClone == 0) {
+            return this._printDebug('FATAL ERROR: The MirrorUserID is not set or Total group to clone is 0!');
+        }
+
+        // Get mirror user informations
+        var grMirrorUser = new GlideRecord('sys_user');
+        grMirrorUser.get(this._mirroUserID);
+        var mirroUserID = grMirrorUser.getUniqueValue();
+
+        this._printDebug('INFO: Mirror User ID: ' + mirroUserID);
+
+        for (var group in groupsToClone) { // Interation inside of object
+            this._insertGroups(groupsToClone[group], mirroUserID); // send sys_id of group by paramether
+            if (this.debug) break;
+        }
+    },
+
+    
+    _printDebug: function (msg) {
+        if (this.debug) gs.info(msg);
+    },
+
+    type: 'CloneUserGroups'
+});
